@@ -16,6 +16,9 @@
    License along with the GNU C Library; if not, see
    <https://www.gnu.org/licenses/>.  */
 
+/* Modified by Keita HAGIWARA, 2025.
+   - Add prototype implementation for SigRPC functionality.  */
+
 #include <errno.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -1349,6 +1352,1174 @@ _dl_start_args_adjust (int skip_args)
 #endif
 }
 
+#include <signal.h>
+#include <ucontext.h>
+#include <linux/limits.h>
+#include <sys/resource.h>
+#include <sys/un.h>
+#include <sys/socket.h>
+#include <sigrpc.h>
+
+static void serialize_header(void *buf, rpc_msg_header_t header)
+{
+  int offset = 0;
+  memcpy(buf + offset, &header.msg_type, sizeof(header.msg_type));
+  offset += sizeof(header.msg_type);
+  memcpy(buf + offset, &header.status, sizeof(header.status));
+  offset += sizeof(header.status);
+  memcpy(buf + offset, &header.client_id, sizeof(header.client_id));
+  offset += sizeof(header.client_id);
+  memcpy(buf + offset, &header.payload_size, sizeof(header.payload_size));
+}
+
+static rpc_msg_header_t deserialize_header(void *buf)
+{
+  rpc_msg_header_t header = {0};
+  int offset = 0;
+  memcpy(&header.msg_type, buf + offset, sizeof(header.msg_type));
+  offset += sizeof(header.msg_type);
+  memcpy(&header.status, buf + offset, sizeof(header.status));
+  offset += sizeof(header.status);
+  memcpy(&header.client_id, buf + offset, sizeof(header.client_id));
+  offset += sizeof(header.client_id);
+  memcpy(&header.payload_size, buf + offset, sizeof(header.payload_size));
+  return header;
+}
+
+static void make_shift(unsigned long *shift, const char *ptrn, unsigned long ptrn_len)
+{
+    unsigned long *border_position = alloca((ptrn_len + 1) * sizeof(unsigned long));
+    unsigned long i = ptrn_len;
+    unsigned long j = i + 1;
+    border_position[i] = j;
+
+    while (i > 0)
+    {
+        while (j <= ptrn_len && ptrn[i - 1] != ptrn[j - 1])
+        {
+            if (shift[j] == 0)
+                shift[j] = j - i;
+            j = border_position[j];
+        }
+        i--;
+        j--;
+        border_position[i] = j;
+    }
+
+    j = border_position[0];
+    for (i = 0;i <= ptrn_len; i++)
+    {
+        if (shift[i] == 0)
+            shift[i] = j;
+        
+        if (i == j)
+            j = border_position[j];
+    }
+}
+
+static char *bm_search(const char *target, const char *ptrn)
+{
+    const unsigned long ptrn_len = __builtin_strlen(ptrn);
+    unsigned long *shift = alloca((ptrn_len + 1) * sizeof(unsigned long));
+
+    __builtin_memset(shift, 0, (ptrn_len + 1) * sizeof(unsigned long));
+    make_shift(shift, ptrn, ptrn_len);
+
+    while (__builtin_strlen(target) >= ptrn_len)
+    {
+        const char *c1 = target + ptrn_len - 1;
+        const char *c2 = ptrn + ptrn_len - 1;
+        while (c1 >= target && *c1 == *c2)
+        {
+            c1--;
+            c2--;
+        }
+        if (c1 < target)
+            return (char *)target;
+        target += shift[c1 - target + 1];
+    }
+    return NULL;
+}
+
+static int want_rpc(const char *file)
+{
+  char *ld_rpc = getenv("LD_RPC");
+  char *rpc_sock_path = getenv("RPC_SOCK_PATH");
+  char *subst = NULL;
+  struct stat buf = {0};
+
+  if (!file)
+    return 0;
+
+  if (!ld_rpc || !rpc_sock_path)
+	  return 0;
+  if (stat(rpc_sock_path, &buf) == -1)
+	  return 0;
+  if (strlen(file) == 0)
+    return 0;
+  if ((subst = bm_search(ld_rpc, file)))
+  {
+	  switch (*(subst - 1))
+	  {
+	  case '=':
+	  case ':':
+	    break;
+    case '/':
+	    if (!strncmp(subst, file, strlen(file)))
+      {
+        char *_subst = subst - 1;
+        while (*_subst == '/')
+          _subst--;
+        switch (*_subst)
+        {
+        case '=':
+        case ':':
+          break;
+        default:
+          return 0;
+        }
+      }
+      break;
+	  default:
+	    return 0;
+	  }
+	  switch (*(subst + strlen(subst)))
+	  {
+	  case '\0':
+	  case ':':
+      return 1;
+	  }
+  }
+  return 0;
+}
+
+static int connect_rpc_sock(void)
+{
+  char *rpc_sock_path = getenv("RPC_SOCK_PATH");
+  struct stat buf = {0};
+
+  if (!rpc_sock_path)
+	  return -1;
+  if (stat(rpc_sock_path, &buf) == -1)
+	  return -1;
+  int fd;
+  struct sockaddr_un addr = {0};
+  addr.sun_family = AF_UNIX;
+  memcpy(addr.sun_path, rpc_sock_path, strlen(rpc_sock_path));
+  if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+    INLINE_SYSCALL(exit, 1, errno);
+  if (connect(fd, (struct sockaddr *)&addr,
+      sizeof(struct sockaddr_un)) < 0)
+    INLINE_SYSCALL(exit, 1, errno);
+  return fd;
+}
+
+__rtld_lock_define_recursive(static, stderr_mtx);
+
+typedef struct successor_list_s {
+  struct successor_list_s *prev;
+  struct successor_list_s *next;
+  uint64_t runtime_revision;
+  int fd;
+} successor_list_t;
+
+typedef struct page_s {
+  uint64_t address;
+  uint64_t wr_addr;
+  uint64_t runtime_revision;
+  uint64_t client_revision;
+  void *content;
+  successor_list_t *successor_list;
+  struct page_s *prev;
+  struct page_s *next;
+  uint64_t stack_ptr;
+  uint32_t size;
+} page_t;
+
+typedef struct page_chain_s {
+  page_t *page;
+  struct page_chain_s *prev;
+  struct page_chain_s *next;
+} page_chain_t;
+
+typedef struct page_tbl_s {
+  page_t *page_list;
+  page_chain_t **page_hash_tbl;
+  uint64_t invokefunc_id;
+  __rtld_lock_define_recursive(, lock);
+} page_tbl_t;
+
+static page_tbl_t page_tbl;
+
+static void init_page_tbl(void)
+{
+  page_tbl.page_hash_tbl = calloc(1 << 16, sizeof(page_chain_t *));
+  if (!page_tbl.page_hash_tbl)
+    INLINE_SYSCALL(exit, 1, errno);
+  __rtld_lock_initialize(page_tbl.lock);
+}
+
+static void lock_page_tbl(void)
+{
+  __rtld_lock_lock_recursive(page_tbl.lock);
+}
+
+static void unlock_page_tbl(void)
+{
+  __rtld_lock_unlock_recursive(page_tbl.lock);
+}
+
+typedef struct curr_page_s {
+  void *curr_page;
+  __rtld_lock_define_recursive(, lock);
+} curr_page_t;
+
+static curr_page_t curr_page;
+
+static void init_curr_page(void)
+{
+  __rtld_lock_initialize(curr_page.lock);
+}
+
+static void lock_curr_page(void)
+{
+  __rtld_lock_lock_recursive(curr_page.lock);
+}
+
+static void unlock_curr_page(void)
+{
+  __rtld_lock_unlock_recursive(curr_page.lock);
+}
+
+static uint64_t calc_page_hash_tbl_idx(uint64_t addr)
+{
+  uint64_t key = addr >> 12;
+  uint64_t hash_mask = (1 << 16) - 1;
+  return key & hash_mask;
+}
+
+static page_chain_t *search_page_in_chain(page_chain_t *chain, uint64_t addr)
+{
+  addr &= 0xfffffffffffff000;
+  if (!chain)
+    return NULL;
+  while (chain && chain->page->address != addr)
+    chain = chain->next;
+  return chain;
+}
+
+static void add_page_list(page_t *entry)
+{
+  entry->prev = NULL;
+  entry->next = page_tbl.page_list;
+  if (entry->next)
+    entry->next->prev = entry;
+  page_tbl.page_list = entry;
+}
+
+static void add_page_hashtbl_entry(page_t *entry)
+{
+  uint64_t idx = calc_page_hash_tbl_idx(entry->address);
+  page_chain_t *new_entry = malloc(sizeof(page_chain_t));
+  if (!new_entry)
+    INLINE_SYSCALL(exit, 1, errno);
+  new_entry->prev = NULL;
+  new_entry->next = page_tbl.page_hash_tbl[idx];
+  if (new_entry->next)
+    new_entry->next->prev = new_entry;
+  new_entry->page = entry;
+  page_tbl.page_hash_tbl[idx] = new_entry;
+}
+
+static void add_page(page_t *entry)
+{
+  add_page_list(entry);
+  add_page_hashtbl_entry(entry);
+}
+
+static void remove_page(uint64_t addr)
+{
+  uint64_t idx = calc_page_hash_tbl_idx(addr);
+  page_chain_t *chain = page_tbl.page_hash_tbl[idx];
+  chain = search_page_in_chain(chain, addr);
+  if (!chain)
+    return;
+  page_t *entry = chain->page;
+  if (entry->prev)
+    entry->prev->next = entry->next;
+  else
+    page_tbl.page_list = entry->next;
+  if (entry->next)
+    entry->next->prev = entry->prev;
+
+  if (chain->prev)
+    chain->prev->next = chain->next;
+  else
+    page_tbl.page_hash_tbl[idx] = chain->next;
+  if (chain->next)
+    chain->next->prev = chain->prev;
+  free(chain);
+  free(entry->content);
+  munmap((void *)entry->address, entry->size);
+  munmap((void *)entry->wr_addr, entry->size);
+  free(entry);
+}
+
+static page_t *get_page(uint64_t addr)
+{
+  uint64_t idx = calc_page_hash_tbl_idx(addr);
+  page_chain_t *chain = search_page_in_chain(page_tbl.page_hash_tbl[idx], addr);
+  if (chain)
+    return chain->page;
+  return NULL;
+}
+
+static void wait_prev_revision(uint64_t addr, uint64_t runtime_revision)
+{
+  uint64_t buf;
+  int fds[2];
+  page_t *page = get_page(addr);
+  assert(page);
+  if (page->runtime_revision + 1 >= runtime_revision)
+    return;
+  successor_list_t suc = {0};
+  suc.next = page->successor_list;
+  page->successor_list = &suc;
+  if (suc.next)
+    suc.next->prev = &suc;
+  if (pipe(fds) == -1)
+    INLINE_SYSCALL(exit, 1, errno);
+  suc.fd = fds[1];
+  unlock_page_tbl();
+  if (read(fds[0], &buf, sizeof(buf)) == -1)
+    INLINE_SYSCALL(exit, 1, errno);
+  lock_page_tbl();
+  close(fds[0]);
+  close(fds[1]);
+  if (suc.prev)
+    suc.prev->next = suc.next;
+  if (suc.next)
+    suc.next->prev = suc.prev;
+  if (!suc.prev)
+    page->successor_list = suc.next;
+}
+
+static void notify_successor(uint64_t addr, uint64_t curr_runtime_revision)
+{
+  page_t *page = get_page(addr);
+  assert(page);
+  successor_list_t *suc_iter = page->successor_list;
+  while (suc_iter)
+  {
+    if (suc_iter->runtime_revision == 0 ||\
+        suc_iter->runtime_revision == curr_runtime_revision + 1)
+      if (write(suc_iter->fd, &curr_runtime_revision,
+          sizeof(curr_runtime_revision)) == -1)
+        INLINE_SYSCALL(exit, 1, errno);
+    suc_iter = suc_iter->next;
+  }
+}
+
+static void *page_exist(void *addr, uint64_t size)
+{
+  void *map_addr = mmap(addr, size, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  if (map_addr == MAP_FAILED)
+    INLINE_SYSCALL(exit, 1, errno);
+  munmap(map_addr, size);
+  if (map_addr == addr)
+    return MAP_FAILED;
+  return addr;
+}
+
+typedef struct msg_buf_s {
+  uint8_t *buf;
+  uint64_t size;
+  uint64_t cap;
+} msg_buf_t;
+
+static msg_buf_t make_msg_buf(uint64_t cap)
+{
+  msg_buf_t buf = {0};
+  buf.buf = mmap(NULL, cap, PROT_WRITE | PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (buf.buf == MAP_FAILED)
+    INLINE_SYSCALL(exit, 1, errno);
+  buf.size = 0;
+  buf.cap = cap;
+  return buf;
+}
+
+static void delete_msg_buf(msg_buf_t buf)
+{
+  munmap(buf.buf, buf.cap);
+}
+
+static void extend_msg_buf(msg_buf_t *buf)
+{
+  buf->buf = mremap(buf->buf, buf->cap, buf->cap << 1, MREMAP_MAYMOVE);
+  if (buf->buf == MAP_FAILED)
+    INLINE_SYSCALL(exit, 1, errno);
+  buf->cap <<= 1;
+}
+
+static void copy_to_buf(msg_buf_t *dst_buf, const void *src_buf, uint64_t size)
+{
+  if (dst_buf->cap < dst_buf->size + size)
+    extend_msg_buf(dst_buf);
+  memcpy(dst_buf->buf + dst_buf->size, src_buf, size);
+  dst_buf->size += size;
+}
+
+static void copy_to_fd(int fd, msg_buf_t *src_buf)
+{
+  ssize_t wr_size = write(fd, src_buf->buf, src_buf->size);
+  if (wr_size != src_buf->size)
+    INLINE_SYSCALL(exit, 1, errno);
+  src_buf->size = 0;
+}
+
+static void copy_from_fd(int fd, msg_buf_t *dst_buf, uint64_t size)
+{
+  while (dst_buf->cap < dst_buf->size + size)
+    extend_msg_buf(dst_buf);
+  ssize_t rd_total = 0;
+  while (rd_total < size)
+  {
+    ssize_t rd_size = read(fd, dst_buf->buf + dst_buf->size, size - rd_total);
+    if (rd_size == -1)
+      INLINE_SYSCALL(exit, 1, errno);
+    rd_total += rd_size;
+    dst_buf->size += rd_size;
+  }
+}
+
+void write_new_page(msg_buf_t *msg_buf, page_t *new_page)
+{
+  copy_to_buf(msg_buf, &new_page->address, sizeof(new_page->address));
+  copy_to_buf(msg_buf, &new_page->runtime_revision, sizeof(new_page->runtime_revision));
+  copy_to_buf(msg_buf, &new_page->client_revision, sizeof(new_page->client_revision));
+  copy_to_buf(msg_buf, &new_page->size, sizeof(new_page->size));
+  copy_to_buf(msg_buf, new_page->content, new_page->size);
+}
+
+uint64_t write_page_diff(msg_buf_t *msg_buf, const void *new_page, page_t *original_page, size_t size)
+{
+  typedef enum
+  {
+      UNCHANGED,
+      CHANGED
+  } check_state;
+  check_state state = UNCHANGED;
+  size_t change_start = 0;
+  uint8_t *new_page_copy = alloca(size);
+  memcpy(new_page_copy, new_page, size);
+  const uint8_t *new_byte_ptr = (const uint8_t *)new_page_copy;
+  uint8_t *original_byte_ptr = (uint8_t *)original_page->content;
+  const uint64_t next_revision = original_page->client_revision + 1;
+  uint64_t init_buf_pos = msg_buf->size;
+
+  size_t offset = 0;
+  if (original_page->stack_ptr)
+    offset = original_page->stack_ptr + sizeof(void *) - original_page->address;
+  while (offset < size)
+  {
+    if (*new_byte_ptr != *original_byte_ptr && state == UNCHANGED)
+    {
+      state = CHANGED;
+      change_start = offset;
+    }
+
+    if (*new_byte_ptr == *original_byte_ptr && state == CHANGED)
+    {
+      state = UNCHANGED;
+      const void *address = new_page + change_start;
+      copy_to_buf(msg_buf, &address, sizeof(address));
+      copy_to_buf(msg_buf, &original_page->runtime_revision, sizeof(original_page->runtime_revision));
+      copy_to_buf(msg_buf, &next_revision, sizeof(next_revision));
+      uint32_t content_size = offset - change_start;
+      copy_to_buf(msg_buf, &content_size, sizeof(content_size));
+      copy_to_buf(msg_buf, new_page_copy + change_start, content_size);
+    }
+
+    ++new_byte_ptr;
+    ++original_byte_ptr;
+    ++offset;
+  }
+
+  if (state == CHANGED)
+  {
+    const void *address = new_page + change_start;
+    copy_to_buf(msg_buf, &address, sizeof(address));
+    copy_to_buf(msg_buf, &original_page->runtime_revision, sizeof(original_page->runtime_revision));
+    copy_to_buf(msg_buf, &next_revision, sizeof(next_revision));
+    uint32_t content_size = offset - change_start;
+    copy_to_buf(msg_buf, &content_size, sizeof(content_size));
+    copy_to_buf(msg_buf, new_page_copy + change_start, content_size);
+  }
+  if (init_buf_pos != msg_buf->size)
+  {
+    memcpy(original_page->content, new_page_copy, size);
+    return next_revision;
+  }
+  if (size == 0)
+  {
+    uint32_t content_size = size;
+    const void *address = new_page + change_start;
+    copy_to_buf(msg_buf, &address, sizeof(address));
+    copy_to_buf(msg_buf, &original_page->runtime_revision, sizeof(original_page->runtime_revision));
+    copy_to_buf(msg_buf, &next_revision, sizeof(next_revision));
+    copy_to_buf(msg_buf, &content_size, sizeof(content_size));
+  }
+  return 0;
+}
+
+typedef struct mem_region_s {
+  uint64_t start;
+  uint64_t end;
+  struct mem_region_s *prev;
+  struct mem_region_s *next;
+} mem_region_t;
+
+typedef struct stack_region_s {
+  mem_region_t *mem_region;
+  __rtld_lock_define_recursive(, lock);
+} stack_region_t;
+
+static stack_region_t stack_region;
+
+static int in_mem_region(mem_region_t *mem_region, uint64_t addr)
+{
+  return mem_region->start <= addr && addr < mem_region->end;
+}
+
+static void init_stack_region(void)
+{
+  stack_region.mem_region = malloc(sizeof(mem_region_t));
+  if (!stack_region.mem_region)
+    INLINE_SYSCALL(exit, 1, errno);
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_STACK, &limit) == -1)
+    INLINE_SYSCALL(exit, 1, errno);
+  assert(limit.rlim_cur > 0x100000);
+  uint64_t end = (uint64_t)__libc_stack_end;
+  stack_region.mem_region->end = (end & 0xfffffffff000) + getpagesize();
+  stack_region.mem_region->start = end - (limit.rlim_cur - 0x100000);
+  stack_region.mem_region->prev = NULL;
+  stack_region.mem_region->next = NULL;
+  __rtld_lock_initialize(stack_region.lock);
+}
+
+static void add_stack_region(void *end)
+{
+  __rtld_lock_lock_recursive(stack_region.lock);
+  mem_region_t *new_stack_region = malloc(sizeof(mem_region_t));
+  if (!new_stack_region)
+    INLINE_SYSCALL(exit, 1, errno);
+  new_stack_region->prev = NULL;
+  new_stack_region->next = stack_region.mem_region;
+  stack_region.mem_region = new_stack_region;
+  if (new_stack_region->next)
+    new_stack_region->next->prev = new_stack_region;
+
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_STACK, &limit) == -1)
+    INLINE_SYSCALL(exit, 1, errno);
+  uint64_t start = (uint64_t)end - limit.rlim_cur;
+  new_stack_region->start = start;
+  new_stack_region->end = (uint64_t)end;
+  __rtld_lock_unlock_recursive(stack_region.lock);
+}
+
+static void delete_stack_region(uint64_t addr)
+{
+  __rtld_lock_lock_recursive(stack_region.lock);
+  mem_region_t *stack_region_iter = stack_region.mem_region;
+  while (stack_region_iter && !in_mem_region(stack_region_iter, addr))
+    stack_region_iter = stack_region_iter->next;
+  if (stack_region_iter)
+  {
+    if (stack_region_iter->prev)
+      stack_region_iter->prev->next = stack_region_iter->next;
+    else
+      stack_region.mem_region = stack_region_iter->next;
+    if (stack_region_iter->next)
+      stack_region_iter->next->prev = stack_region_iter->prev;
+    free(stack_region_iter);
+  }
+  __rtld_lock_unlock_recursive(stack_region.lock);
+}
+
+static uint64_t get_stack_bottom(uint64_t stack_ptr)
+{
+  uint64_t bottom = 0;
+  __rtld_lock_lock_recursive(stack_region.lock);
+  mem_region_t *stack_region_iter = stack_region.mem_region;
+  while (stack_region_iter && !in_mem_region(stack_region_iter, stack_ptr))
+    stack_region_iter = stack_region_iter->next;
+  if (stack_region_iter)
+    bottom = stack_region_iter->end;
+  __rtld_lock_unlock_recursive(stack_region.lock);
+  return bottom;
+}
+
+static uint64_t count_gnu_hash_symbol(struct link_map *map)
+{
+  uint64_t max_bucket = 0;
+  for (size_t i = 0;i < map->l_nbuckets;i++)
+  {
+    Elf32_Word bucket = map->l_gnu_buckets[i];
+    if (bucket > max_bucket)
+      max_bucket = bucket;
+  }
+  uint64_t max_chain_idx = max_bucket;
+  while (1)
+  {
+    const Elf32_Word *hasharr = &map->l_gnu_chain_zero[max_chain_idx];
+    if (*hasharr & 1)
+      break;
+    max_chain_idx++;
+  }
+  return max_chain_idx + 1;
+}
+
+static unsigned long calc_loadlib_msg_size(struct link_map *map, const char *file)
+{
+  unsigned long msg_size = RPC_HEADER_SIZE + strlen(file) + /* null byte */ 1;
+  const char *strtab = NULL;
+  ElfW(Sym) *symtab = NULL;
+
+  for (ElfW(Dyn) *dynobj = map->l_ld;dynobj->d_tag != DT_NULL;dynobj++)
+  {
+    switch (dynobj->d_tag)
+    {
+    case DT_STRTAB:
+      strtab = (const char *)(dynobj->d_un.d_ptr);
+      break;
+    case DT_SYMTAB:
+      symtab = (ElfW(Sym) *)(dynobj->d_un.d_ptr);
+      break;
+    }
+  }
+  uint64_t max_sym = count_gnu_hash_symbol(map);
+  for (Elf_Symndx sym_cnt = 0;sym_cnt < max_sym;sym_cnt++)
+  {
+    switch (symtab->st_info)
+    {
+    case ELF64_ST_INFO(STB_GLOBAL, STT_FUNC):
+    case ELF64_ST_INFO(STB_WEAK, STT_FUNC):
+    case ELF64_ST_INFO(STB_GLOBAL, STT_GNU_IFUNC):
+    case ELF64_ST_INFO(STB_WEAK, STT_GNU_IFUNC):
+      if (symtab->st_size && symtab->st_other == ELF64_ST_VISIBILITY(STV_DEFAULT))
+      {
+        /* put function address */
+        msg_size += sizeof(void *);
+        /* put function name */
+        msg_size += strlen(strtab + symtab->st_name) + /* null byte */ 1;
+      }
+    }
+    symtab++;
+  }
+  return msg_size;
+}
+
+static void handle_loadlib(struct link_map *map, const char *file, int rpc_fd)
+{
+  char *strtab = NULL;
+  ElfW(Sym) *symtab = NULL;
+  void *func = NULL;
+  int mprotect_size = getpagesize();
+  const uint64_t page_mask = 0xfffffffffffff000;
+  uint64_t bufsize = calc_loadlib_msg_size(map, file);
+  uint64_t payload_size = bufsize - RPC_HEADER_SIZE;
+  void *msg_buf = alloca(bufsize);
+  void *msg_offset = msg_buf;
+  rpc_msg_header_t header = {.msg_type = LOADLIB, .status = STATUS_OK, .client_id = getpid(), .payload_size = payload_size,};
+  
+  serialize_header(msg_buf, header);
+  msg_offset += RPC_HEADER_SIZE;
+  memcpy(msg_offset, file, strlen(file) + /* null byte */ 1);
+  msg_offset += strlen(file) + /* null byte */ 1;
+
+  for (ElfW(Dyn) *dynobj = map->l_ld;dynobj->d_tag != DT_NULL;dynobj++)
+  {
+    switch (dynobj->d_tag)
+    {
+    case DT_STRTAB:
+      strtab = (char *)(dynobj->d_un.d_ptr);
+      break;
+    case DT_SYMTAB:
+      symtab = (ElfW(Sym) *)(dynobj->d_un.d_ptr);
+      break;
+    }
+  }
+
+  uint64_t max_sym = count_gnu_hash_symbol(map);
+  for (Elf_Symndx sym_cnt = 0;sym_cnt < max_sym;sym_cnt++)
+  {
+    switch (symtab->st_info)
+    {
+    case ELF64_ST_INFO(STB_GLOBAL, STT_FUNC):
+    case ELF64_ST_INFO(STB_WEAK, STT_FUNC):
+    case ELF64_ST_INFO(STB_GLOBAL, STT_GNU_IFUNC):
+    case ELF64_ST_INFO(STB_WEAK, STT_GNU_IFUNC):
+      if (symtab->st_size && symtab->st_other == ELF64_ST_VISIBILITY(STV_DEFAULT))
+      {
+        func = (void *)(map->l_addr + symtab->st_value);
+        if (symtab->st_info == ELF64_ST_INFO(STB_GLOBAL, STT_GNU_IFUNC) ||\
+            symtab->st_info == ELF64_ST_INFO(STB_WEAK, STT_GNU_IFUNC))
+          func = (void *)((DL_FIXUP_VALUE_TYPE (*) (void)) (func)) ();
+        /* put function address */
+        memcpy(msg_offset, &func, sizeof(void *));
+        msg_offset += sizeof(void *);
+
+        /* put function name */
+        memcpy(msg_offset, strtab + symtab->st_name,
+          strlen(strtab + symtab->st_name) + /*null byte */ 1);
+        msg_offset += strlen(strtab + symtab->st_name) + /* null byte */ 1;
+
+        /* put sigill */
+        void *page_start = (void *)((uint64_t)func & page_mask);
+        if (mprotect(page_start, mprotect_size, PROT_READ | PROT_WRITE | PROT_EXEC))
+          INLINE_SYSCALL(exit, 1, errno);
+        
+        *(uint8_t *)(func) = 0xd4;  /* #UD opcode */
+
+        if (mprotect(page_start, mprotect_size, PROT_READ | PROT_EXEC))
+          INLINE_SYSCALL(exit, 1, errno);
+      }
+    }
+    symtab++;
+  }
+
+  /* send message */
+  if (write(rpc_fd, msg_buf, bufsize) != bufsize)
+    INLINE_SYSCALL(exit, 1, errno);
+
+  if (read(rpc_fd, msg_buf, RPC_HEADER_SIZE) !=\
+      RPC_HEADER_SIZE)
+    INLINE_SYSCALL(exit, 1, errno);
+  header = deserialize_header(msg_buf);
+  if (header.msg_type != LOADLIB || header.status != STATUS_OK)
+    INLINE_SYSCALL(exit, 1, header.status);
+
+  close(rpc_fd);
+}
+
+static void handle_invokefunc(ucontext_t *ctx)
+{
+  const uint64_t page_mask = 0xfffffffffffff000;
+  uint64_t prev_page_addr = 0;
+  const int page_size = getpagesize();
+  msg_buf_t msg_buf = make_msg_buf(page_size * 4);
+  rpc_msg_header_t header = {0};
+  page_t *new_page = NULL;
+  uint64_t invokefunc_id;
+  struct timespec start, end;
+  lock_page_tbl();
+  INLINE_SYSCALL(clock_gettime, 2, CLOCK_MONOTONIC, &start);
+  uint64_t stack_bottom = get_stack_bottom(ctx->uc_mcontext.gregs[REG_RSP]);
+  assert(stack_bottom);
+  invokefunc_id = page_tbl.invokefunc_id++;
+  copy_to_buf(&msg_buf, &header, RPC_HEADER_SIZE); /* seek buf */
+  copy_to_buf(&msg_buf, &invokefunc_id, sizeof(invokefunc_id));
+  copy_to_buf(&msg_buf, ctx->uc_mcontext.gregs, sizeof(gregset_t)); /* gregs */
+  copy_to_buf(&msg_buf, ctx->uc_mcontext.fpregs, sizeof(struct _libc_fpstate)); /* x87/SSE */
+  copy_to_buf(&msg_buf, &stack_bottom, sizeof(stack_bottom)); /* stack bottom */
+  page_t *page = page_tbl.page_list;
+  while (page)
+  {
+    uint64_t buf_size = msg_buf.size;
+    uint64_t rev = 0;
+page_check:
+    if (page_exist((void *)page->address, page_size) == MAP_FAILED)
+    {
+      write_page_diff(&msg_buf, (void *)page->address, page, 0);
+      page_t *tmp = page;
+      page = page->next;
+      delete_stack_region(tmp->address);
+      remove_page(tmp->address);
+      continue;
+    }
+    lock_curr_page();
+    curr_page.curr_page = (void *)page->address;
+    rev = write_page_diff(&msg_buf, (void *)page->address, page, page->size);
+    // write(2, "write_page_diff\n", 16);
+    if (!curr_page.curr_page)
+    {
+      munmap((void *)page->address, page->size);
+      unlock_curr_page();
+      msg_buf.size = buf_size;
+      goto page_check;
+    }
+    unlock_curr_page();
+    if (rev && rev != page->client_revision)
+      page->client_revision++;
+    page = page->next;
+  }
+
+  if (!get_page(ctx->uc_mcontext.gregs[REG_RSP]))
+  {
+    page_t *stack_page = malloc(sizeof(page_t));
+    if (!stack_page)
+      INLINE_SYSCALL(exit, 1, errno);
+    stack_page->address = ctx->uc_mcontext.gregs[REG_RSP] & page_mask;
+    stack_page->wr_addr = stack_page->address;
+    stack_page->runtime_revision = 0;
+    stack_page->client_revision = 0;
+    stack_page->content = malloc(page_size);
+    if (!stack_page->content)
+      INLINE_SYSCALL(exit, 1, errno);
+    stack_page->size = page_size;
+    stack_page->successor_list = NULL;
+    stack_page->prev = NULL;
+    stack_page->next = NULL;
+    memcpy(stack_page->content,
+          (void *)(ctx->uc_mcontext.gregs[REG_RSP] & page_mask), page_size);
+    add_page(stack_page);
+    write_new_page(&msg_buf, stack_page);
+  }
+  page_t *stack_page = get_page(ctx->uc_mcontext.gregs[REG_RSP]);
+  assert(stack_page);
+  stack_page->stack_ptr = ctx->uc_mcontext.gregs[REG_RSP];
+  unlock_page_tbl();
+  header.msg_type = INVOKEFUNC;
+  header.status = 0;
+  header.client_id = getpid();
+  header.payload_size = msg_buf.size - RPC_HEADER_SIZE;
+  serialize_header(msg_buf.buf, header);
+
+  INLINE_SYSCALL(clock_gettime, 2, CLOCK_MONOTONIC, &end);
+  
+  int rpc_fd = connect_rpc_sock();
+
+send_message:
+  copy_to_fd(rpc_fd, &msg_buf);
+
+  copy_from_fd(rpc_fd, &msg_buf, RPC_HEADER_SIZE);
+  header = deserialize_header(msg_buf.buf);
+  copy_from_fd(rpc_fd, &msg_buf, header.payload_size);
+  INLINE_SYSCALL(clock_gettime, 2, CLOCK_MONOTONIC, &start);
+  if (header.msg_type != INVOKEFUNC)
+    INLINE_SYSCALL(exit, 1, 0);
+  if (header.status != STATUS_OK && header.status != STATUS_NOT_FOUND)
+    INLINE_SYSCALL(exit, 1, header.status);
+  
+  uint64_t msg_offset = RPC_HEADER_SIZE +\
+               sizeof(uint64_t) /* invokefunc_id */ +\
+               sizeof(gregset_t) +\
+               sizeof(struct _libc_fpstate) +\
+               sizeof(uint64_t) /* stack_bottom */;
+  while (msg_offset < msg_buf.size)
+  {
+    page_t page = {0};
+    page.address = *(uint64_t *)(msg_buf.buf + msg_offset);
+    msg_offset += sizeof(page.address);
+    page.runtime_revision = *(uint64_t *)(msg_buf.buf + msg_offset);
+    msg_offset += sizeof(page.runtime_revision);
+    page.client_revision = *(uint64_t *)(msg_buf.buf + msg_offset);
+    msg_offset += sizeof(page.client_revision);
+    page.size = *(uint32_t *)(msg_buf.buf + msg_offset);
+    if (header.status == STATUS_NOT_FOUND)
+    {
+      stack_bottom = 0;
+      msg_buf.size = RPC_HEADER_SIZE +\
+                   sizeof(uint64_t) /* invokefunc_id */ +\
+                   sizeof(gregset_t) +\
+                   sizeof(struct _libc_fpstate);
+      page.size = page_size;
+      new_page = malloc(sizeof(page_t));
+      if (!new_page)
+        INLINE_SYSCALL(exit, 1, errno);
+      memcpy(new_page, &page, sizeof(page));
+      new_page->content = malloc(page_size);
+      if (!new_page->content)
+        INLINE_SYSCALL(exit, 1, errno);
+      lock_page_tbl();
+      memcpy(new_page->content, (void *)new_page->address, new_page->size);
+      new_page->wr_addr = new_page->address;
+      add_page(new_page);
+      unlock_page_tbl();
+      copy_to_buf(&msg_buf, &stack_bottom, sizeof(stack_bottom));
+      copy_to_buf(&msg_buf, &new_page->address, sizeof(new_page->address));
+      copy_to_buf(&msg_buf, &new_page->runtime_revision, sizeof(new_page->runtime_revision));
+      copy_to_buf(&msg_buf, &new_page->client_revision, sizeof(new_page->client_revision));
+      copy_to_buf(&msg_buf, &new_page->size, sizeof(new_page->size));
+      copy_to_buf(&msg_buf, new_page->content, new_page->size);
+      header.status = STATUS_OK;
+      header.payload_size = msg_buf.size - RPC_HEADER_SIZE;
+      serialize_header(msg_buf.buf, header);
+      goto send_message;
+    }
+    if (page.size == 0)
+    {
+      remove_page(page.address);
+      continue;
+    }
+    lock_page_tbl();
+    if (prev_page_addr && prev_page_addr != (page.address & page_mask))
+    {
+      page_t *prev_page = get_page(prev_page_addr);
+      assert(prev_page);
+      uint64_t rev = prev_page->runtime_revision++;
+      notify_successor(prev_page->address, rev);
+    }
+    prev_page_addr = page.address & page_mask;
+    msg_offset += sizeof(page.size);
+    page.content = msg_buf.buf + msg_offset;
+    msg_offset += page.size;
+    page_t *wr_page = get_page(page.address);
+    assert(wr_page);
+    wait_prev_revision(page.address, page.runtime_revision);
+    uint64_t min_offset = wr_page->stack_ptr + sizeof(void *) - wr_page->address;
+    uint64_t offset = page.address - wr_page->address;
+    memcpy((void *)(wr_page->content + offset), page.content, page.size);
+    if (wr_page->stack_ptr && min_offset > offset && offset + page.size > min_offset)
+    {
+      page.size -= min_offset - offset;
+      page.content += min_offset - offset;
+      offset = min_offset;
+    }
+    else if (wr_page->stack_ptr && min_offset > offset)
+      page.size = 0;
+    if (page.size)
+      memcpy((void *)(wr_page->wr_addr + offset), page.content, page.size);
+    unlock_page_tbl();
+  }
+  close(rpc_fd);
+  lock_page_tbl();
+  if (prev_page_addr)
+  {
+    page_t *prev_page = get_page(prev_page_addr);
+    if (prev_page)
+    {
+      uint64_t rev = prev_page->runtime_revision++;
+      notify_successor(prev_page->address, rev);
+    }
+  }
+  stack_page = get_page(ctx->uc_mcontext.gregs[REG_RSP]);
+  assert(stack_page);
+  stack_page->stack_ptr = 0;
+  INLINE_SYSCALL(clock_gettime, 2, CLOCK_MONOTONIC, &end);
+  unlock_page_tbl();
+  memcpy(ctx->uc_mcontext.gregs,
+          msg_buf.buf + RPC_HEADER_SIZE + sizeof(uint64_t),
+          sizeof(gregset_t));
+  memcpy(ctx->uc_mcontext.fpregs,
+          msg_buf.buf + RPC_HEADER_SIZE + sizeof(uint64_t) + sizeof(gregset_t),
+          sizeof(struct _libc_fpstate));
+  delete_msg_buf(msg_buf);
+  return;
+}
+
+static void restore_from_sigill(ucontext_t *ctx)
+{
+  asm volatile(
+    "fxrstor (%%rax)"
+    :
+    : "a"(ctx->uc_mcontext.fpregs)
+    :);
+  asm volatile(
+    "push %%rax\n\t"
+    "popfq"
+    :
+    : "a"(ctx->uc_mcontext.gregs[REG_EFL])
+    :);
+  asm volatile(
+    "mov %0, %%rsp"        
+    :
+    : "m"(ctx->uc_mcontext.gregs[REG_RSP])
+    :);
+#define SAVE_GREG(R)                         \
+  asm volatile(                              \
+    "push %%rax"                           \
+    :                                      \
+    : "a"(ctx->uc_mcontext.gregs[REG_##R]) \
+    :)
+
+  SAVE_GREG(RCX);
+  SAVE_GREG(RAX);
+  SAVE_GREG(RDX);
+  SAVE_GREG(RBX);
+  SAVE_GREG(RBP);
+  SAVE_GREG(RSI);
+  SAVE_GREG(RDI);
+  SAVE_GREG(R8);
+  SAVE_GREG(R9);
+  SAVE_GREG(R10);
+  SAVE_GREG(R11);
+  SAVE_GREG(R12);
+  SAVE_GREG(R13);
+  SAVE_GREG(R14);
+  SAVE_GREG(R15);
+#undef SAVE_GREG
+  asm volatile(
+    "pop %r15\n\t"
+    "pop %r14\n\t"
+    "pop %r13\n\t"
+    "pop %r12\n\t"
+    "pop %r11\n\t"
+    "pop %r10\n\t"
+    "pop %r9\n\t"
+    "pop %r8\n\t"
+    "pop %rdi\n\t"
+    "pop %rsi\n\t"
+    "pop %rbp\n\t"
+    "pop %rbx\n\t"
+    "pop %rdx\n\t"
+    "pop %rax\n\t"
+    "pop %rcx\n\t"
+    "ret"
+  );
+}
+
+static void sigill_handler(int signal, siginfo_t *si, void *arg) {
+	ucontext_t *ctx = arg;
+  handle_invokefunc(ctx);
+  restore_from_sigill(ctx);
+}
+
+static void restore_from_sigsegv(ucontext_t *ctx)
+{
+  asm volatile(
+    "fxrstor (%%rax)"
+    :
+    : "a"(ctx->uc_mcontext.fpregs)
+    :);
+  asm volatile(
+    "push %%rax\n\t"
+    "popfq"
+    :
+    : "a"(ctx->uc_mcontext.gregs[REG_EFL])
+    :);
+  asm volatile(
+    "mov %0, %%rsp"        
+    :
+    : "m"(ctx->uc_mcontext.gregs[REG_RSP])
+    :);
+  #define SAVE_GREG(R)                         \
+  asm volatile(                              \
+    "push %%rax"                           \
+    :                                      \
+    : "a"(ctx->uc_mcontext.gregs[REG_##R]) \
+    :)
+  SAVE_GREG(RIP);
+  SAVE_GREG(RCX);
+  SAVE_GREG(RAX);
+  SAVE_GREG(RDX);
+  SAVE_GREG(RBX);
+  SAVE_GREG(RBP);
+  SAVE_GREG(RSI);
+  SAVE_GREG(RDI);
+  SAVE_GREG(R8);
+  SAVE_GREG(R9);
+  SAVE_GREG(R10);
+  SAVE_GREG(R11);
+  SAVE_GREG(R12);
+  SAVE_GREG(R13);
+  SAVE_GREG(R14);
+  SAVE_GREG(R15);
+  #undef SAVE_GREG
+  asm volatile(
+    "pop %r15\n\t"
+    "pop %r14\n\t"
+    "pop %r13\n\t"
+    "pop %r12\n\t"
+    "pop %r11\n\t"
+    "pop %r10\n\t"
+    "pop %r9\n\t"
+    "pop %r8\n\t"
+    "pop %rdi\n\t"
+    "pop %rsi\n\t"
+    "pop %rbp\n\t"
+    "pop %rbx\n\t"
+    "pop %rdx\n\t"
+    "pop %rax\n\t"
+    "pop %rcx\n\t"
+    "ret"
+  );
+}
+
+static void sigsegv_handler(int signal, siginfo_t *si, void *arg)
+{
+  ucontext_t *ctx = arg;
+  const uint64_t page_mask = 0xfffffffffffff000;
+  if ((uint64_t)si->si_addr == ctx->uc_mcontext.gregs[REG_RIP])
+    sigill_handler(signal, si, arg);
+  if (((uint64_t)si->si_addr & page_mask) == (uint64_t)curr_page.curr_page)
+  {
+    void *mapped_addr = mmap(curr_page.curr_page, getpagesize(),
+                              PROT_WRITE | PROT_READ,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (curr_page.curr_page != mapped_addr)
+      INLINE_SYSCALL(exit, 1, errno);
+    curr_page.curr_page = NULL;
+    restore_from_sigsegv(ctx);
+  }
+  lock_page_tbl();
+  if (get_page((uint64_t)si->si_addr))
+  {
+    wait_prev_revision((uint64_t)si->si_addr, 0);
+    unlock_page_tbl();
+    restore_from_sigsegv(ctx);
+  }
+  msg_buf_t msg_buf = make_msg_buf(getpagesize() << 1);
+  rpc_msg_header_t header = {.msg_type = PULLPAGE, .status = STATUS_OK, .client_id = getpid(),};
+  msg_buf.size = RPC_HEADER_SIZE;
+  page_t *request_page = malloc(sizeof(page_t));
+  if (!request_page)
+    INLINE_SYSCALL(exit, 1, errno);
+  memset(request_page, 0, sizeof(page_t));
+  request_page->address = (uint64_t)si->si_addr & page_mask;
+  add_page(request_page);
+  unlock_page_tbl();
+  copy_to_buf(&msg_buf, &request_page->address, sizeof(request_page->address));
+  copy_to_buf(&msg_buf, &request_page->runtime_revision, sizeof(request_page->runtime_revision));
+  copy_to_buf(&msg_buf, &request_page->client_revision, sizeof(request_page->client_revision));
+  copy_to_buf(&msg_buf, &request_page->size, sizeof(request_page->size));
+  header.payload_size = msg_buf.size;
+  serialize_header(msg_buf.buf, header);
+  int fd = connect_rpc_sock();
+  copy_to_fd(fd, &msg_buf);
+  copy_from_fd(fd, &msg_buf, RPC_HEADER_SIZE);
+  header = deserialize_header(&msg_buf);
+  copy_from_fd(fd, &msg_buf, header.payload_size);
+  close(fd);
+  lock_page_tbl();
+  if (header.status != STATUS_OK)
+    INLINE_SYSCALL(exit, 1, header.status);
+  uint64_t msg_offset = RPC_HEADER_SIZE +\
+                        sizeof(request_page->address) +\
+                        sizeof(request_page->runtime_revision) +\
+                        sizeof(request_page->client_revision);
+  request_page->size = *(uint32_t *)(msg_buf.buf + msg_offset);
+  msg_offset += sizeof(request_page->size);
+  request_page->content = malloc(request_page->size);
+  if (!request_page->content)
+    INLINE_SYSCALL(exit, 1, errno);
+  memcpy(request_page->content, msg_buf.buf + msg_offset, request_page->size);
+  int memfd = memfd_create("", MFD_CLOEXEC);
+  if (memfd == -1)
+    INLINE_SYSCALL(exit, 1, errno);
+  if (ftruncate(memfd, request_page->size) == -1)
+    INLINE_SYSCALL(exit, 1, errno);
+  void *wr_addr = mmap(NULL, request_page->size,
+                       PROT_READ | PROT_WRITE,
+                       MAP_SHARED, memfd, 0);
+  if (wr_addr == MAP_FAILED)
+    INLINE_SYSCALL(exit, 1, errno);
+  memcpy(wr_addr, request_page->content, request_page->size);
+  request_page->wr_addr = (uint64_t)wr_addr;
+  void *mapped_addr = mmap((void *)request_page->address,
+                            request_page->size, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, memfd, 0);
+  if (mapped_addr != (void *)request_page->address)
+    INLINE_SYSCALL(exit, 1, errno);
+  close(memfd);
+  delete_msg_buf(msg_buf);
+  notify_successor(request_page->address, 0);
+  unlock_page_tbl();
+  restore_from_sigsegv(ctx);
+}
+
 static void
 dl_main (const ElfW(Phdr) *phdr,
 	 ElfW(Word) phnum,
@@ -2411,6 +3582,55 @@ dl_main (const ElfW(Phdr) *phdr,
   /* We must munmap() the cache file.  */
   _dl_unload_cache ();
 #endif
+
+  struct link_map *rpc_link = main_map;
+  int rpc_fd = -1;
+  while (rpc_link)
+  {
+    int found_rpc_link = 0;
+    struct libname_list *name_list = rpc_link->l_libname;
+    while (name_list)
+    {
+      found_rpc_link = want_rpc(name_list->name);
+      if (found_rpc_link != 0)
+        break;
+      name_list = name_list->next;
+    }
+    if (found_rpc_link != 0)
+    {
+      rpc_fd = connect_rpc_sock();
+      if (rpc_fd != -1)
+      {
+        handle_loadlib(rpc_link, name_list->name, rpc_fd);
+        close(rpc_fd);
+      }
+    }
+    rpc_link = rpc_link->l_next;
+  }
+  {
+    struct sigaction sa = {0};
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = sigill_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGILL, &sa, NULL);
+  }
+  {
+    struct sigaction sa = {0};
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = sigsegv_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGSEGV, &sa, NULL);
+  }
+  init_page_tbl();
+  init_curr_page();
+  init_stack_region();
+
+  if (mmap((void *)FIXED_PAGE_ADDR, getpagesize(), PROT_WRITE | PROT_READ,
+      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED)
+    INLINE_SYSCALL(exit, 1, errno);
+  fixed_page_t *fixed_page = (fixed_page_t *)FIXED_PAGE_ADDR;
+  fixed_page->add_stack_region = add_stack_region;
+  __rtld_lock_initialize(stderr_mtx);
 
   /* Once we return, _dl_sysdep_start will invoke
      the DT_INIT functions and then *USER_ENTRY.  */

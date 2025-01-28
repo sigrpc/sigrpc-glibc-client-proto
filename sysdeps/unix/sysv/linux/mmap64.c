@@ -16,11 +16,16 @@
    License along with the GNU C Library; if not, see
    <https://www.gnu.org/licenses/>.  */
 
+/* Modified by Keita HAGIWARA, 2025.
+   - Fix address range  */
+
 #include <errno.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sysdep.h>
 #include <mmap_internal.h>
+#include <sys/random.h>
+#include <sigrpc.h>
 
 #ifdef __NR_mmap2
 /* To avoid silent truncation of offset when using mmap2, do not accept
@@ -45,18 +50,36 @@
 void *
 __mmap64 (void *addr, size_t len, int prot, int flags, int fd, off64_t offset)
 {
+retry:
+  uint64_t rnd = 0;
+  void *mapped_addr = NULL;
+  INLINE_SYSCALL(getrandom, 3, &rnd, sizeof(rnd) >> 1, 0);
+  if (!addr)
+    addr = (void *)(MMAP_BASE + (rnd << 12));
   MMAP_CHECK_PAGE_UNIT ();
 
   if (offset & MMAP_OFF_MASK)
-    return (void *) INLINE_SYSCALL_ERROR_RETURN_VALUE (EINVAL);
+    mapped_addr = (void *) INLINE_SYSCALL_ERROR_RETURN_VALUE (EINVAL);
 
   MMAP_PREPARE (addr, len, prot, flags, fd, offset);
 #ifdef __NR_mmap2
-  return (void *) MMAP_CALL (mmap2, addr, len, prot, flags, fd,
+  mapped_addr = (void *) MMAP_CALL (mmap2, addr, len, prot, flags, fd,
 			     (off_t) (offset / MMAP2_PAGE_UNIT));
 #else
-  return (void *) MMAP_CALL (mmap, addr, len, prot, flags, fd, offset);
+  mapped_addr = (void *) MMAP_CALL (mmap, addr, len, prot, flags, fd, offset);
 #endif
+  if (addr != mapped_addr)
+  {
+    munmap(mapped_addr, len);
+    addr = NULL;
+    goto retry;
+  }
+  if (flags & MAP_STACK)
+  {
+    fixed_page_t *handler = (fixed_page_t *)FIXED_PAGE_ADDR;
+    handler->add_stack_region(addr + len);
+  }
+  return mapped_addr;
 }
 weak_alias (__mmap64, mmap64)
 libc_hidden_def (__mmap64)
