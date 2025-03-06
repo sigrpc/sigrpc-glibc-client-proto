@@ -1519,7 +1519,7 @@ __rtld_lock_define_recursive(static, stderr_mtx);
 typedef struct successor_list_s {
   struct successor_list_s *prev;
   struct successor_list_s *next;
-  uint64_t runtime_revision;
+  uint64_t cmp;
   int fd;
 } successor_list_t;
 
@@ -1546,6 +1546,8 @@ typedef struct page_tbl_s {
   page_t *page_list;
   page_chain_t **page_hash_tbl;
   uint64_t invokefunc_id;
+  uint64_t runnable_resp_id;
+  successor_list_t *successor_list;
   __rtld_lock_define_recursive(, lock);
 } page_tbl_t;
 
@@ -1557,6 +1559,7 @@ static void init_page_tbl(void)
   if (!page_tbl.page_hash_tbl)
     INLINE_SYSCALL(exit, 1, errno);
   __rtld_lock_initialize(page_tbl.lock);
+  page_tbl.runnable_resp_id = -1;
 }
 
 static void lock_page_tbl(void)
@@ -1674,22 +1677,21 @@ static page_t *get_page(uint64_t addr)
   return NULL;
 }
 
-static void wait_prev_revision(uint64_t addr, uint64_t runtime_revision)
+static void wait_prev(uint64_t curr, uint64_t self, successor_list_t **suc_list)
 {
   uint64_t buf;
   int fds[2];
-  page_t *page = get_page(addr);
-  assert(page);
-  if (page->runtime_revision + 1 >= runtime_revision)
+  if (curr == self || curr + 1 == self)
     return;
   successor_list_t suc = {0};
-  suc.next = page->successor_list;
-  page->successor_list = &suc;
+  suc.next = *suc_list;
+  *suc_list = &suc;
   if (suc.next)
     suc.next->prev = &suc;
   if (pipe(fds) == -1)
     INLINE_SYSCALL(exit, 1, errno);
   suc.fd = fds[1];
+  suc.cmp = self;
   unlock_page_tbl();
   if (read(fds[0], &buf, sizeof(buf)) == -1)
     INLINE_SYSCALL(exit, 1, errno);
@@ -1701,23 +1703,46 @@ static void wait_prev_revision(uint64_t addr, uint64_t runtime_revision)
   if (suc.next)
     suc.next->prev = suc.prev;
   if (!suc.prev)
-    page->successor_list = suc.next;
+    *suc_list = suc.next;
 }
 
-static void notify_successor(uint64_t addr, uint64_t curr_runtime_revision)
+static void wait_prev_revision(uint64_t addr, uint64_t runtime_revision, uint64_t resp_id)
+{
+  page_t *page = get_page(addr);
+  assert(page);
+  wait_prev(page->runtime_revision, runtime_revision, &page->successor_list);
+}
+
+static void wait_prev_resp(uint64_t resp_id)
+{
+  wait_prev(page_tbl.runnable_resp_id, resp_id, &page_tbl.successor_list);
+}
+
+static void notify_successor(successor_list_t *suc_iter, uint64_t curr)
+{
+  while (suc_iter)
+  {
+    if (suc_iter->cmp == curr + 1)
+    {
+      if (write(suc_iter->fd, &curr, sizeof(curr)) == -1)
+        INLINE_SYSCALL(exit, 1, errno);
+    }
+    suc_iter = suc_iter->next;
+  }
+}
+
+static void notify_successor_revision(uint64_t addr, uint64_t curr_runtime_revision)
 {
   page_t *page = get_page(addr);
   assert(page);
   successor_list_t *suc_iter = page->successor_list;
-  while (suc_iter)
-  {
-    if (suc_iter->runtime_revision == 0 ||\
-        suc_iter->runtime_revision == curr_runtime_revision + 1)
-      if (write(suc_iter->fd, &curr_runtime_revision,
-          sizeof(curr_runtime_revision)) == -1)
-        INLINE_SYSCALL(exit, 1, errno);
-    suc_iter = suc_iter->next;
-  }
+  addr &= 0xfffffffffffff000;
+  notify_successor(suc_iter, curr_runtime_revision);
+}
+
+static void notify_successor_resp(uint64_t resp_id)
+{
+  notify_successor(page_tbl.successor_list, resp_id);
 }
 
 static void *page_exist(void *addr, uint64_t size)
@@ -2113,14 +2138,14 @@ static void handle_invokefunc(ucontext_t *ctx)
   rpc_msg_header_t header = {0};
   page_t *new_page = NULL;
   uint64_t invokefunc_id;
-  struct timespec start, end;
+  uint64_t resp_id = 0;
   lock_page_tbl();
-  INLINE_SYSCALL(clock_gettime, 2, CLOCK_MONOTONIC, &start);
   uint64_t stack_bottom = get_stack_bottom(ctx->uc_mcontext.gregs[REG_RSP]);
   assert(stack_bottom);
   invokefunc_id = page_tbl.invokefunc_id++;
   copy_to_buf(&msg_buf, &header, RPC_HEADER_SIZE); /* seek buf */
   copy_to_buf(&msg_buf, &invokefunc_id, sizeof(invokefunc_id));
+  copy_to_buf(&msg_buf, &resp_id, sizeof(resp_id));
   copy_to_buf(&msg_buf, ctx->uc_mcontext.gregs, sizeof(gregset_t)); /* gregs */
   copy_to_buf(&msg_buf, ctx->uc_mcontext.fpregs, sizeof(struct _libc_fpstate)); /* x87/SSE */
   copy_to_buf(&msg_buf, &stack_bottom, sizeof(stack_bottom)); /* stack bottom */
@@ -2186,8 +2211,6 @@ page_check:
   header.client_id = getpid();
   header.payload_size = msg_buf.size - RPC_HEADER_SIZE;
   serialize_header(msg_buf.buf, header);
-
-  INLINE_SYSCALL(clock_gettime, 2, CLOCK_MONOTONIC, &end);
   
   int rpc_fd = connect_rpc_sock();
 
@@ -2197,14 +2220,14 @@ send_message:
   copy_from_fd(rpc_fd, &msg_buf, RPC_HEADER_SIZE);
   header = deserialize_header(msg_buf.buf);
   copy_from_fd(rpc_fd, &msg_buf, header.payload_size);
-  INLINE_SYSCALL(clock_gettime, 2, CLOCK_MONOTONIC, &start);
   if (header.msg_type != INVOKEFUNC)
     INLINE_SYSCALL(exit, 1, 0);
   if (header.status != STATUS_OK && header.status != STATUS_NOT_FOUND)
     INLINE_SYSCALL(exit, 1, header.status);
-  
+
   uint64_t msg_offset = RPC_HEADER_SIZE +\
-               sizeof(uint64_t) /* invokefunc_id */ +\
+               sizeof(invokefunc_id) +\
+               sizeof(resp_id) +\
                sizeof(gregset_t) +\
                sizeof(struct _libc_fpstate) +\
                sizeof(uint64_t) /* stack_bottom */;
@@ -2218,11 +2241,13 @@ send_message:
     page.client_revision = *(uint64_t *)(msg_buf.buf + msg_offset);
     msg_offset += sizeof(page.client_revision);
     page.size = *(uint32_t *)(msg_buf.buf + msg_offset);
+    msg_offset += sizeof(page.size);
     if (header.status == STATUS_NOT_FOUND)
     {
       stack_bottom = 0;
       msg_buf.size = RPC_HEADER_SIZE +\
-                   sizeof(uint64_t) /* invokefunc_id */ +\
+                   sizeof(invokefunc_id) +\
+                   sizeof(resp_id) +\
                    sizeof(gregset_t) +\
                    sizeof(struct _libc_fpstate);
       page.size = page_size;
@@ -2254,21 +2279,21 @@ send_message:
       remove_page(page.address);
       continue;
     }
+    void *_resp_id = msg_buf.buf + RPC_HEADER_SIZE + sizeof(invokefunc_id);
     lock_page_tbl();
     if (prev_page_addr && prev_page_addr != (page.address & page_mask))
     {
       page_t *prev_page = get_page(prev_page_addr);
       assert(prev_page);
-      uint64_t rev = prev_page->runtime_revision++;
-      notify_successor(prev_page->address, rev);
+      prev_page->runtime_revision++;
+      notify_successor_revision(prev_page->address, prev_page->runtime_revision);
     }
     prev_page_addr = page.address & page_mask;
-    msg_offset += sizeof(page.size);
     page.content = msg_buf.buf + msg_offset;
     msg_offset += page.size;
     page_t *wr_page = get_page(page.address);
     assert(wr_page);
-    wait_prev_revision(page.address, page.runtime_revision);
+    wait_prev_revision(page.address, page.runtime_revision, *(uint64_t *)_resp_id);
     uint64_t min_offset = wr_page->stack_ptr + sizeof(void *) - wr_page->address;
     uint64_t offset = page.address - wr_page->address;
     memcpy((void *)(wr_page->content + offset), page.content, page.size);
@@ -2291,151 +2316,36 @@ send_message:
     page_t *prev_page = get_page(prev_page_addr);
     if (prev_page)
     {
-      uint64_t rev = prev_page->runtime_revision++;
-      notify_successor(prev_page->address, rev);
+      prev_page->runtime_revision++;
+      notify_successor_revision(prev_page->address, prev_page->runtime_revision);
     }
   }
+  memcpy(&resp_id,
+          msg_buf.buf + RPC_HEADER_SIZE + sizeof(invokefunc_id),
+          sizeof(resp_id));
+  wait_prev_resp(resp_id);
+  page_tbl.runnable_resp_id = resp_id;
+  notify_successor_resp(page_tbl.runnable_resp_id);
   stack_page = get_page(ctx->uc_mcontext.gregs[REG_RSP]);
   assert(stack_page);
   stack_page->stack_ptr = 0;
-  INLINE_SYSCALL(clock_gettime, 2, CLOCK_MONOTONIC, &end);
   unlock_page_tbl();
   memcpy(ctx->uc_mcontext.gregs,
-          msg_buf.buf + RPC_HEADER_SIZE + sizeof(uint64_t),
+          msg_buf.buf + RPC_HEADER_SIZE + sizeof(invokefunc_id) + sizeof(resp_id),
           sizeof(gregset_t));
   memcpy(ctx->uc_mcontext.fpregs,
-          msg_buf.buf + RPC_HEADER_SIZE + sizeof(uint64_t) + sizeof(gregset_t),
+          msg_buf.buf + RPC_HEADER_SIZE + sizeof(invokefunc_id) + sizeof(resp_id) + sizeof(gregset_t),
           sizeof(struct _libc_fpstate));
+  memcpy(&ctx->uc_mcontext.gregs[REG_RIP], (void *)ctx->uc_mcontext.gregs[REG_RSP], sizeof(void *));
+  ctx->uc_mcontext.gregs[REG_RSP] += sizeof(void *);
   delete_msg_buf(msg_buf);
   return;
-}
-
-static void restore_from_sigill(ucontext_t *ctx)
-{
-  asm volatile(
-    "fxrstor (%%rax)"
-    :
-    : "a"(ctx->uc_mcontext.fpregs)
-    :);
-  asm volatile(
-    "push %%rax\n\t"
-    "popfq"
-    :
-    : "a"(ctx->uc_mcontext.gregs[REG_EFL])
-    :);
-  asm volatile(
-    "mov %0, %%rsp"        
-    :
-    : "m"(ctx->uc_mcontext.gregs[REG_RSP])
-    :);
-#define SAVE_GREG(R)                         \
-  asm volatile(                              \
-    "push %%rax"                           \
-    :                                      \
-    : "a"(ctx->uc_mcontext.gregs[REG_##R]) \
-    :)
-
-  SAVE_GREG(RCX);
-  SAVE_GREG(RAX);
-  SAVE_GREG(RDX);
-  SAVE_GREG(RBX);
-  SAVE_GREG(RBP);
-  SAVE_GREG(RSI);
-  SAVE_GREG(RDI);
-  SAVE_GREG(R8);
-  SAVE_GREG(R9);
-  SAVE_GREG(R10);
-  SAVE_GREG(R11);
-  SAVE_GREG(R12);
-  SAVE_GREG(R13);
-  SAVE_GREG(R14);
-  SAVE_GREG(R15);
-#undef SAVE_GREG
-  asm volatile(
-    "pop %r15\n\t"
-    "pop %r14\n\t"
-    "pop %r13\n\t"
-    "pop %r12\n\t"
-    "pop %r11\n\t"
-    "pop %r10\n\t"
-    "pop %r9\n\t"
-    "pop %r8\n\t"
-    "pop %rdi\n\t"
-    "pop %rsi\n\t"
-    "pop %rbp\n\t"
-    "pop %rbx\n\t"
-    "pop %rdx\n\t"
-    "pop %rax\n\t"
-    "pop %rcx\n\t"
-    "ret"
-  );
 }
 
 static void sigill_handler(int signal, siginfo_t *si, void *arg) {
 	ucontext_t *ctx = arg;
   handle_invokefunc(ctx);
-  restore_from_sigill(ctx);
-}
-
-static void restore_from_sigsegv(ucontext_t *ctx)
-{
-  asm volatile(
-    "fxrstor (%%rax)"
-    :
-    : "a"(ctx->uc_mcontext.fpregs)
-    :);
-  asm volatile(
-    "push %%rax\n\t"
-    "popfq"
-    :
-    : "a"(ctx->uc_mcontext.gregs[REG_EFL])
-    :);
-  asm volatile(
-    "mov %0, %%rsp"        
-    :
-    : "m"(ctx->uc_mcontext.gregs[REG_RSP])
-    :);
-  #define SAVE_GREG(R)                         \
-  asm volatile(                              \
-    "push %%rax"                           \
-    :                                      \
-    : "a"(ctx->uc_mcontext.gregs[REG_##R]) \
-    :)
-  SAVE_GREG(RIP);
-  SAVE_GREG(RCX);
-  SAVE_GREG(RAX);
-  SAVE_GREG(RDX);
-  SAVE_GREG(RBX);
-  SAVE_GREG(RBP);
-  SAVE_GREG(RSI);
-  SAVE_GREG(RDI);
-  SAVE_GREG(R8);
-  SAVE_GREG(R9);
-  SAVE_GREG(R10);
-  SAVE_GREG(R11);
-  SAVE_GREG(R12);
-  SAVE_GREG(R13);
-  SAVE_GREG(R14);
-  SAVE_GREG(R15);
-  #undef SAVE_GREG
-  asm volatile(
-    "pop %r15\n\t"
-    "pop %r14\n\t"
-    "pop %r13\n\t"
-    "pop %r12\n\t"
-    "pop %r11\n\t"
-    "pop %r10\n\t"
-    "pop %r9\n\t"
-    "pop %r8\n\t"
-    "pop %rdi\n\t"
-    "pop %rsi\n\t"
-    "pop %rbp\n\t"
-    "pop %rbx\n\t"
-    "pop %rdx\n\t"
-    "pop %rax\n\t"
-    "pop %rcx\n\t"
-    "ret"
-  );
+  return;
 }
 
 static void sigsegv_handler(int signal, siginfo_t *si, void *arg)
@@ -2452,14 +2362,14 @@ static void sigsegv_handler(int signal, siginfo_t *si, void *arg)
     if (curr_page.curr_page != mapped_addr)
       INLINE_SYSCALL(exit, 1, errno);
     curr_page.curr_page = NULL;
-    restore_from_sigsegv(ctx);
+    return;
   }
   lock_page_tbl();
   if (get_page((uint64_t)si->si_addr))
   {
-    wait_prev_revision((uint64_t)si->si_addr, 0);
+    wait_prev_revision((uint64_t)si->si_addr, 0, 0);
     unlock_page_tbl();
-    restore_from_sigsegv(ctx);
+    return;
   }
   msg_buf_t msg_buf = make_msg_buf(getpagesize() << 1);
   rpc_msg_header_t header = {.msg_type = PULLPAGE, .status = STATUS_OK, .client_id = getpid(),};
@@ -2475,12 +2385,12 @@ static void sigsegv_handler(int signal, siginfo_t *si, void *arg)
   copy_to_buf(&msg_buf, &request_page->runtime_revision, sizeof(request_page->runtime_revision));
   copy_to_buf(&msg_buf, &request_page->client_revision, sizeof(request_page->client_revision));
   copy_to_buf(&msg_buf, &request_page->size, sizeof(request_page->size));
-  header.payload_size = msg_buf.size;
+  header.payload_size = msg_buf.size - RPC_HEADER_SIZE;
   serialize_header(msg_buf.buf, header);
   int fd = connect_rpc_sock();
   copy_to_fd(fd, &msg_buf);
   copy_from_fd(fd, &msg_buf, RPC_HEADER_SIZE);
-  header = deserialize_header(&msg_buf);
+  header = deserialize_header(msg_buf.buf);
   copy_from_fd(fd, &msg_buf, header.payload_size);
   close(fd);
   lock_page_tbl();
@@ -2515,9 +2425,8 @@ static void sigsegv_handler(int signal, siginfo_t *si, void *arg)
     INLINE_SYSCALL(exit, 1, errno);
   close(memfd);
   delete_msg_buf(msg_buf);
-  notify_successor(request_page->address, 0);
+  notify_successor_revision(request_page->address, 0);
   unlock_page_tbl();
-  restore_from_sigsegv(ctx);
 }
 
 static void
